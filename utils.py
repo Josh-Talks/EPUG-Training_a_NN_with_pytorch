@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+from typing import Collection, List, Union
 import matplotlib.pyplot as plt
 from functools import partial
 from itertools import product
@@ -17,6 +19,7 @@ from sklearn.model_selection import train_test_split  # pyright: ignore
 
 from imageio.v2 import imread
 from tqdm import tqdm, trange
+from zipfile import ZipFile
 
 
 #
@@ -54,6 +57,21 @@ def make_cifar_train_val_split(images, labels, validation_fraction=0.15):
     assert len(val_images) == len(val_labels)
     assert len(train_images) + len(val_images) == len(images)
     return train_images, train_labels, val_images, val_labels
+
+
+def get_folder_names(zip_path: Union[Path, str]) -> List[str]:
+    if isinstance(zip_path, str):
+        zip_path = Path(zip_path)
+    with ZipFile(zip_path, "r") as zf:
+        folder_names = sorted(name for name in zf.namelist() if name.count("/") == 1)
+    return folder_names
+
+
+def extract(zf: ZipFile, output_path: Path, member_folders: Collection[str]):
+    members = [
+        name for name in zf.namelist() if name[: name.index("/") + 1] in member_folders
+    ]
+    zf.extractall(output_path, members)
 
 
 #
@@ -151,6 +169,20 @@ def get_default_cifar_transform():
 #
 # visualisation functionality
 #
+
+
+class RunningAverage:
+    """Computes and stores the average"""
+
+    def __init__(self):
+        self.count = 0
+        self.sum = 0
+        self.avg = 0
+
+    def update(self, value, n=1):
+        self.count += n
+        self.sum += value * n
+        self.avg = self.sum / self.count
 
 
 def make_confusion_matrix(labels, predictions, categories, ax):

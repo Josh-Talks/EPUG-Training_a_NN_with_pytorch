@@ -1,0 +1,1 @@
+# EPUG -- Training your own neural network for image analysis with PyTorch

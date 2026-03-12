@@ -1,0 +1,22 @@
+name: EPUG
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - matplotlib
+  - imageio
+  - tqdm
+  - scikit-learn
+  - scikit-image
+  - jupyterlab
+  - notebook
+  - ipykernel
+  - tensorboard
+  - setuptools=80.9.0
+  - pytorch
+  - torchvision
+  - pip:
+      - cifar2png

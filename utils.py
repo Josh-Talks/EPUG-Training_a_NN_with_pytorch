@@ -207,3 +207,176 @@ def make_confusion_matrix(labels, predictions, categories, ax):
     plt.tight_layout()
     plt.ylabel("True label")
     plt.xlabel("Predicted label")
+
+
+### Train and Validation
+
+from typing import Literal, assert_never
+
+
+def train(
+    model, 
+    loader, 
+    loss_function, 
+    optimizer,
+    device, 
+    epoch,
+    tb_logger, 
+    log_image_interval=100,
+    task: Literal["classification", "segmentation"]="classification"
+):
+    """ Train model for one epoch.
+    
+    Parameters:
+    model - the model we are training
+    loader - the data loader that provides the training data
+        (= pairs of images and labels)
+    loss_function - the loss function that will be optimized
+    optimizer - the optimizer that is used to update the network parameters
+        by backpropagation of the loss
+    device - the device used for training. this can either be the cpu or gpu
+    epoch - which trainin eppch are we in? we keep track of this for logging
+    tb_logger - the tensorboard logger, it is used to communicate with tensorboard
+    log_image_interval - how often do we send images to tensborboard?
+    task - the type of task we are solving (classification or segmentation)
+    """
+
+    # set model to train mode
+    model.train()
+    
+    # iterate over the training batches provided by the loader
+    n_batches = len(loader)
+    for batch_id, (x, y) in enumerate(loader):
+       
+        # send data and target tensors to the active device
+        x = x.to(device)
+        y = y.to(device)
+        
+        # set the gradients to zero, to start with "clean" gradients
+        # in this training iteration
+        optimizer.zero_grad()
+        
+        # apply the model to get the prediction
+        prediction = model(x)
+        
+        # calculate the loss
+        if task == "classification":
+            # (negative log likelihood loss)
+            # the loss function expects a 1d tensor, but we get a 2d tensor
+            # with singleton second dimension, so we get rid of this dimension
+            loss_value = loss_function(prediction, y[:, 0])
+        elif task == "segmentation":
+            loss_value = loss_function(prediction, y)
+        else:
+            assert_never(task)
+        
+        # calculate the gradients (`loss.backward()`) 
+        # and apply them to the model parameters with
+        # to our optimizer (`optimizer.step()`)
+        loss_value.backward()
+        optimizer.step()
+        
+        # log the loss value to tensorboard
+        step = epoch * n_batches + batch_id
+        tb_logger.add_scalar(tag='train-loss', 
+                             scalar_value=loss_value.item(),
+                             global_step=step)
+        
+        # Logging the learning rate to tensorboard
+        lr = optimizer.param_groups[0]['lr']
+        tb_logger.add_scalar(tag='learning-rate',
+                              scalar_value=lr,
+                              global_step=step)
+
+        # check if we log images, and if we do then send the
+        # current image to tensorboard
+        if log_image_interval is not None and step % log_image_interval == 0:
+            tb_logger.add_images(tag='input', 
+                                 img_tensor=x.to('cpu'),
+                                 global_step=step)
+    
+
+# the validation function takes the model, runs prediction for
+# all images provided by the loader and evaluates the results.
+def validate(
+    model, 
+    loader,
+    loss_function, 
+    device,
+    step,
+    metric,
+    tb_logger=None,
+    task: Literal["classification", "segmentation"]="classification"
+):
+    """
+    Validate the model predictions.
+    
+    Parameters:
+    model - the model to be evaluated
+    loader - the loader providing images and labels
+    loss_function - the loss function
+    device - the device used for prediction (cpu or gpu)
+    step - the current training step. we need to know this for logging
+    tb_logger - the tensorboard logger. if 'None', logging is disabled
+    """
+    # set the model to eval mode
+    model.eval()
+   
+    # we record the loss and the predictions / labels for all samples
+    predictions = []
+    labels = []
+
+    val_scores = RunningAverage()
+    val_losses = RunningAverage()
+    
+    # the model parameters should not be updated during validation
+    # torch.no_grad disables gradient updates in its scope
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+            prediction = model(x)
+            
+            if task == "classification":
+                # update the loss 
+                val_loss = loss_function(prediction, y[:, 0]).item()
+                val_losses.update(val_loss, n=x.shape[0])
+
+                # compute the most likely class predictions
+                # note that 'max' returns a tuple with the 
+                # index of the maximun value (which correponds to the predicted class)
+                # as second entry
+                prediction = prediction.max(1, keepdim=True)[1]
+
+                # store the predictions and labels
+                predictions.append(prediction[:, 0].to('cpu').numpy())
+                labels.append(y[:, 0].to('cpu').numpy())
+
+            elif task == "segmentation":
+                val_loss = loss_function(prediction, y).item()
+                val_losses.update(val_loss, n=x.shape[0])
+                val_score = metric(prediction, y).item()
+                val_scores.update(val_score, n=x.shape[0])
+                
+                
+    if task == "classification":
+        # predictions and labels to numpy arrays
+        predictions = np.concatenate(predictions)
+        labels = np.concatenate(labels)
+
+        metric_value = metric(labels, predictions)
+    elif task == "segmentation":
+        metric_value = val_scores.avg
+    
+    # log the validation results if we have a tensorboard
+    if tb_logger is not None:
+        
+        tb_logger.add_scalar(tag="validation-metric",
+                             global_step=step,
+                             scalar_value=metric_value)
+        tb_logger.add_scalar(tag="validation-loss",
+                             global_step=step,
+                             scalar_value=val_losses.avg)
+
+    # return all predictions and labels for further evaluation
+    return predictions, labels, metric_value

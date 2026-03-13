@@ -1,4 +1,5 @@
 data/
+checkpoints/
 runs/
 .vscode/
 __pycache__/

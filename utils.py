@@ -4,6 +4,9 @@ from typing import Collection, List, Union
 import matplotlib.pyplot as plt
 from functools import partial
 from itertools import product
+from torchvision import transforms
+from scipy.ndimage import binary_erosion
+from PIL import Image
 
 import numpy as np
 import torch
@@ -166,10 +169,87 @@ def get_default_cifar_transform():
     return trafos
 
 
-#
-# visualisation functionality
-#
+class RandomCrop(object):
+    """Crop randomly the input image and the output mask"""
+    def __init__(self, crop_size):
+        # check if the crop size is of a valid type
+        assert isinstance(crop_size, (int, tuple, list))
+        if isinstance(crop_size, int):
+            # if the crop size is an integer, we use the same for both dimensions
+            self.output_size = (crop_size, crop_size)
+        else:
+            assert len(crop_size) == 2
+            self.crop_size = crop_size
 
+    # this function makes our class callable 
+    def __call__(self, sample):
+        # we need to crop both input and mask at the same time
+        assert len(sample) == 2
+        image, mask = sample
+        # the first dimension is channels, then width, then height
+        w, h = image.shape[1:]
+        new_w, new_h = self.output_size
+        # choose a random place to crop
+        top = np.random.randint(0, h - new_h) if h - new_h > 0 else 0
+        left = np.random.randint(0, w - new_w) if w - new_w > 0 else 0
+        # crop and return
+        image = image[:, left: left + new_w, top: top + new_h]
+        mask = mask[:, left: left + new_w, top: top + new_h]
+        return image, mask
+
+
+
+# any PyTorch dataset class should inherit the initial torch.utils.data.Dataset
+class NucleiDataset(Dataset):
+    """ A PyTorch dataset to load cell images and nuclei masks """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir  # the directory with all the training samples
+        self.samples = os.listdir(root_dir) # list the samples
+        self.transform = transform    # transformations to apply to both inputs and targets
+        #  transformations to apply just to inputs
+        self.inp_transforms = transforms.Compose([transforms.Grayscale(), # some of the images are RGB
+                                                  transforms.ToTensor(),
+                                                  transforms.Normalize([0.5], [0.5])])
+        # transformations to apply just to targets
+        self.mask_transforms = transforms.ToTensor()
+
+    # get the total number of samples
+    def __len__(self):
+        return len(self.samples)
+
+    # fetch the training sample given its index
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.samples[idx],
+                                'images', self.samples[idx]+'.png')
+        # we'll be using Pillow library for reading files
+        image = Image.open(img_path)
+        image = self.inp_transforms(image)
+        masks_dir = os.path.join(self.root_dir, self.samples[idx], 'masks')
+        # masks directory has multiple images - one mask per nucleus
+        masks_list = os.listdir(masks_dir)
+        # create an empty array
+        mask = torch.zeros_like(image)
+        # iterate through the images to sum them up to one mask
+        for mask_name in masks_list:
+            one_nuclei_mask = Image.open(os.path.join(masks_dir, mask_name))
+            # erode the image by one pixel
+            # TASK: guess why is this done?
+            one_nuclei_mask = binary_erosion(one_nuclei_mask)
+            one_nuclei_mask = self.mask_transforms(one_nuclei_mask)
+            # add this nucleus to the mask
+            mask += one_nuclei_mask
+        if self.transform is not None:
+            image, mask = self.transform([image, mask])
+        
+        # add singleton channel dimension to the mask
+        #mask = mask.unsqueeze(0)
+        return image, mask
+
+
+
+#
+# Evaluate
+#
 
 class RunningAverage:
     """Computes and stores the average"""
@@ -184,6 +264,26 @@ class RunningAverage:
         self.sum += value * n
         self.avg = self.sum / self.count
 
+
+# sorensen dice coefficient implemented in torch
+# the coefficient takes values in [0, 1], where 0 is
+# the worst score, 1 is the best score
+class DiceCoefficient(nn.Module):
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        
+    # the dice coefficient of two sets represented as vectors a, b ca be 
+    # computed as (2 *|a b| / (a^2 + b^2))
+    def forward(self, prediction, target):
+        intersection = (prediction * target).sum()
+        denominator = (prediction * prediction).sum() + (target * target).sum()
+        return (2 * intersection / denominator.clamp(min=self.eps))
+
+
+#
+# visualisation functionality
+#
 
 def make_confusion_matrix(labels, predictions, categories, ax):
     cm = metrics.confusion_matrix(labels, predictions)
@@ -294,6 +394,72 @@ def train(
             tb_logger.add_images(tag='input', 
                                  img_tensor=x.to('cpu'),
                                  global_step=step)
+            
+
+
+def run_nuclei_training(
+    model, 
+    optimizer, 
+    train_loader, 
+    val_loader,
+    loss_function,
+    metric,
+    device, 
+    name, 
+    n_epochs
+):
+    """Complete training logic"""
+
+    best_accuracy = 0.0
+
+    # loss_function = nn.NLLLoss()
+    loss_function.to(device)
+
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
+
+    # Logging to tensorboard
+    tb_logger = SummaryWriter(f'runs/{name}')
+
+    # Path to save model checkpoint
+    checkpoint_dir = "./checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = f"{checkpoint_dir}/best_checkpoint_{name}.pt"
+    
+
+    for epoch in trange(n_epochs):
+        train(
+            model,
+            train_loader,
+            loss_function,
+            optimizer,
+            device,
+            epoch,
+            tb_logger,
+            task="segmentation"
+        )
+        step = (epoch + 1) * len(train_loader)
+
+        _, _, val_metric = validate(
+            model,
+            val_loader,
+            loss_function,
+            device,
+            step,
+            metric=metric,
+            tb_logger=tb_logger,
+            task="segmentation"
+        )
+        scheduler.step(val_metric)
+
+        # otherwise, check if this is our best epoch
+        if val_metric > best_accuracy:
+            # if it is, save this check point
+            best_accuracy = val_metric
+            save_checkpoint(model, optimizer, epoch, checkpoint_path)
+
+
+    return checkpoint_path
+
     
 
 # the validation function takes the model, runs prediction for
@@ -380,3 +546,108 @@ def validate(
 
     # return all predictions and labels for further evaluation
     return predictions, labels, metric_value
+
+
+## Model
+
+def save_checkpoint(model, optimizer, epoch, save_path):
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        save_path,
+    )
+
+class UNet(nn.Module):
+    """ UNet implementation
+    Arguments:
+      in_channels: number of input channels
+      out_channels: number of output channels
+      final_activation: activation applied to the network output
+    """
+    
+    # _conv_block and _upsampler are just helper functions to
+    # construct the model.
+    # encapsulating them like so also makes it easy to re-use
+    # the model implementation with different architecture elements
+    
+    # Convolutional block for single layer of the decoder / encoder
+    # we apply to 2d convolutions with relu activation
+    def _conv_block(self, in_channels, out_channels):
+        return nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                             nn.ReLU(),
+                             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                             nn.ReLU())       
+
+
+    # upsampling via transposed 2d convolutions
+    def _upsampler(self, in_channels, out_channels):
+        return nn.ConvTranspose2d(in_channels, out_channels,
+                                kernel_size=2, stride=2)
+    
+    def __init__(self, in_channels=1, out_channels=1, 
+                 final_activation=None):
+        super().__init__()
+        
+        # the depth (= number of encoder / decoder levels) is
+        # hard-coded to 4
+        self.depth = 4
+
+        # the final activation must either be None or a Module
+        if final_activation is not None:
+            assert isinstance(final_activation, nn.Module), "Activation must be torch module"
+        
+        # all lists of conv layers (or other nn.Modules with parameters) must be wraped
+        # itnto a nn.ModuleList
+        
+        # modules of the encoder path
+        self.encoder = nn.ModuleList([self._conv_block(in_channels, 16),
+                                      self._conv_block(16, 32),
+                                      self._conv_block(32, 64),
+                                      self._conv_block(64, 128)])
+        # the base convolution block
+        self.base = self._conv_block(128, 256)
+        # modules of the decoder path
+        self.decoder = nn.ModuleList([self._conv_block(256, 128),
+                                      self._conv_block(128, 64),
+                                      self._conv_block(64, 32),
+                                      self._conv_block(32, 16)])
+        
+        # the pooling layers; we use 2x2 MaxPooling
+        self.poolers = nn.ModuleList([nn.MaxPool2d(2) for _ in range(self.depth)])
+        # the upsampling layers
+        self.upsamplers = nn.ModuleList([self._upsampler(256, 128),
+                                         self._upsampler(128, 64),
+                                         self._upsampler(64, 32),
+                                         self._upsampler(32, 16)])
+        # output conv and activation
+        # the output conv is not followed by a non-linearity, because we apply
+        # activation afterwards
+        self.out_conv = nn.Conv2d(16, out_channels, 1)
+        self.activation = final_activation
+    
+    def forward(self, input):
+        x = input
+        # apply encoder path
+        encoder_out = []
+        for level in range(self.depth):
+            x = self.encoder[level](x)
+            encoder_out.append(x)
+            x = self.poolers[level](x)
+
+        # apply base
+        x = self.base(x)
+        
+        # apply decoder path
+        encoder_out = encoder_out[::-1]
+        for level in range(self.depth):
+            x = self.upsamplers[level](x)
+            x = self.decoder[level](torch.cat((x, encoder_out[level]), dim=1))
+        
+        # apply output conv and activation (if given)
+        x = self.out_conv(x)
+        if self.activation is not None:
+            x = self.activation(x)
+        return x

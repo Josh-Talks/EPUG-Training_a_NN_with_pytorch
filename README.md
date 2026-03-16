@@ -2,8 +2,8 @@
 
 This repo gives a short introduction to training a neural network (NN) using PyTorch. The two notebooks,
 
-- EPUG_train_NN.ipynb
-- U-Net_extension.ipynb
+- `EPUG_train_NN.ipynb`
+- `U-Net_extension.ipynb`
 
 introduce the basic components for working with imaging data and training your own NN. The first notebook `EPUG_train_NN_ipynb` walks through working with a dataset using Pytorch `Dataset`s and `Dataloader`s, defining your own neural network, defining a training and validation loop, training your own model and evaluating the results. The second notebook extends the lessons learned from notebook 1 to build your own U-Net based architecture and train and evaulate your model on nuclei semantic segmentation.
 
